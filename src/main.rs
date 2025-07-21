@@ -1,37 +1,48 @@
-use std::{io::{Read, Write}, net::TcpListener};
+use std::{io::{Read, Write}, net::{TcpListener, TcpStream}};
 mod parser;
 use parser::Parser;
 mod router;
 use router::Router;
 
-// use http_server::parser::p
-fn main() {
-    // remove all tcp stuff, hide it from user, allow only defined mehods, and give function to start server on specific port
-    let stream = TcpListener::bind("127.0.0.1:4421").unwrap();
-
-    let (mut socket, addr) = stream.accept().expect("accept failed");
-
+fn handle_connection(stream: TcpStream, router: &Router) {
+    let mut stream = stream;
     let mut buffer = [0u8; 1024];
-    socket.read(&mut buffer).unwrap();
+    stream.read(&mut buffer).unwrap();
 
 
     let request_obj = Parser::parse(&buffer);
 
-    let mut router = Router::new();
+    router.execute(&request_obj, &mut stream);
+}
 
-    router.add_method(String::from("GET"), String::from("/"), || {
-    println!("Handler called!");
+pub struct HttpServer {
+    router: Router
+}
+
+impl HttpServer {
+    fn new() -> Self{
+        let router = Router::new();
+        HttpServer { router }
+    }
+
+    fn listen(&self, connection_string: String) {
+        let stream = TcpListener::bind(connection_string).unwrap();
+
+        for con in stream.incoming() {
+                handle_connection(con.unwrap(), &self.router);
+            }
+    }
+}
+
+fn main() {
+    let mut server = HttpServer::new();
+ 
+    server.router.add_method(String::from("GET"), String::from("/"), |req, response| {
+        response.status(200).text(String::from("OK")).send();
     });
-    
-    println!("req obj??{:?}", request_obj);
-    router.use_router(&request_obj, &socket);
-    
-    
-    println!("lets see request obj {:?}", request_obj);
 
-
-    socket.write_all(b"HTTP/1.1 200 OK\r\n\r\n").unwrap()
-
-    
+    server.listen(String::from("127.0.0.1:4221"));
+  
+  
 }
 
