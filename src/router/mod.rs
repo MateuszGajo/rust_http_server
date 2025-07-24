@@ -13,11 +13,16 @@ use crate::parser::Request;
 pub struct Route {
     pub method: String,
     pub path: String,
-    pub callback: fn(&Request, &mut Response),
+    pub callback: fn(&Request, &mut Response, &Context),
+}
+
+pub struct Context {
+    pub directory_path: String,
 }
 
 pub struct Router {
     handlers: Vec<Route>,
+    context: Context,
 }
 
 pub struct Response<'a> {
@@ -44,6 +49,7 @@ impl<'a> Response<'a> {
         self.status = status;
         self.status_msg = match status {
             200 => String::from("OK"),
+            201 => String::from("Created"),
             404 => String::from("Not Found"),
             _ => panic!("not handled status code"),
         };
@@ -55,8 +61,9 @@ impl<'a> Response<'a> {
         self
     }
 
-    pub fn set_header(&mut self, name: String, value: String) {
+    pub fn set_header(&mut self, name: String, value: String) -> &mut Self {
         self.headers.insert(name, value);
+        self
     }
 
     pub fn send(&mut self) {
@@ -64,10 +71,10 @@ impl<'a> Response<'a> {
         if !self.text.is_empty() {
             if self.headers.get("Content-Type").is_none() {
                 self.headers
-                    .insert(String::from("Content-type"), String::from("text/plain"));
+                    .insert(String::from("Content-Type"), String::from("text/plain"));
             }
             self.headers
-                .insert(String::from("Content-length"), self.text.len().to_string());
+                .insert(String::from("Content-Length"), self.text.len().to_string());
 
             for (key, value) in &self.headers {
                 headers_resp.push_str(&format!("{}: {}\r\n", key, value));
@@ -83,8 +90,11 @@ impl<'a> Response<'a> {
 }
 
 impl Router {
-    pub fn new(handlers: Vec<Route>) -> Self {
-        Router { handlers }
+    pub fn new(handlers: Vec<Route>, directory_path: String) -> Self {
+        Router {
+            handlers,
+            context: Context { directory_path },
+        }
     }
 
     fn extract_path_params(template: String, path: String) -> Option<HashMap<String, String>> {
@@ -116,7 +126,7 @@ impl Router {
             {
                 if route.method == request.method {
                     request.path_params = path_params;
-                    (route.callback)(request, &mut response);
+                    (route.callback)(request, &mut response, &self.context);
                     return;
                 };
             }

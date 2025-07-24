@@ -9,7 +9,7 @@ pub struct Request {
     pub version: String,
     pub headers: HashMap<String, String>,
     pub path_params: HashMap<String, String>,
-    pub body: Vec<u8>,
+    pub body: String,
 }
 
 impl Parser {
@@ -46,7 +46,15 @@ impl Parser {
             println!("Header: {}", line)
         }
 
-        let body = Vec::new();
+        let mut body = String::new();
+        let content_length: usize = headers
+            .get("Content-Length")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        if let Some(line) = lines.next() {
+            body = line[0..content_length].to_string()
+        }
 
         let request = Request {
             version: version.to_string(),
