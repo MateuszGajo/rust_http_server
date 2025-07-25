@@ -5,9 +5,10 @@ use std::{
     sync::{Mutex, mpsc},
     thread::{self, JoinHandle},
 };
+mod encoding;
 mod parser;
-use parser::Parser;
 mod router;
+use parser::Parser;
 use router::Router;
 use std::fs;
 use std::sync::Arc;
@@ -256,6 +257,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use crate::encoding::{Encoding, SupportedEncoding};
+
     use super::*;
     use std::fs::File;
     use std::io::{Read, Write};
@@ -461,5 +464,38 @@ mod tests {
         };
 
         assert_eq!(data, "12345");
+    }
+
+    #[test]
+    fn test_be_gzip_encoded() {
+        let address = "127.0.0.1:4339";
+
+        start_test_server(ServerConfig {
+            address: address.to_string(),
+            ..ServerConfig::default()
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let request = "GET /echo/abc HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n";
+        stream.write_all(request.as_bytes()).unwrap();
+
+        let mut buffer = Vec::new();
+        stream.read_to_end(&mut buffer).unwrap();
+
+        let header_end = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("Invalid http response");
+
+        let (header_bytes, body_bytes) = buffer.split_at(header_end + 4);
+
+        let decoded_body = Encoding::decode("gzip", body_bytes.to_vec()).unwrap();
+
+        let headers_str = String::from_utf8_lossy(header_bytes);
+        let body_str = String::from_utf8_lossy(&decoded_body);
+
+        assert!(headers_str.contains("HTTP/1.1 200 OK"));
+        assert!(headers_str.contains("Content-Encoding: gzip"));
+        assert!(body_str.contains("abc"));
     }
 }

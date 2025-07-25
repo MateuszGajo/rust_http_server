@@ -1,14 +1,8 @@
-use std::sync::Arc;
-use std::{
-    collections::HashMap,
-    io::{self, Write},
-    net::TcpStream,
-    path,
-    thread::sleep,
-    time::Duration,
-};
+use std::{collections::HashMap, io::Write, net::TcpStream};
 
+use crate::encoding::Encoding;
 use crate::parser::Request;
+
 #[derive(Clone)]
 pub struct Route {
     pub method: String,
@@ -32,10 +26,15 @@ pub struct Response<'a> {
     socket: &'a mut TcpStream,
     protocol: String,
     headers: HashMap<String, String>,
+    req_headers: HashMap<String, String>,
 }
 
 impl<'a> Response<'a> {
-    pub fn new(socket: &'a mut TcpStream, protocol: String) -> Self {
+    pub fn new(
+        socket: &'a mut TcpStream,
+        protocol: String,
+        req_headers: HashMap<String, String>,
+    ) -> Self {
         Response {
             status: 200,
             text: String::new(),
@@ -43,6 +42,7 @@ impl<'a> Response<'a> {
             protocol,
             status_msg: String::from("OK"),
             headers: HashMap::new(),
+            req_headers,
         }
     }
     pub fn status(&mut self, status: i32) -> &mut Self {
@@ -67,7 +67,6 @@ impl<'a> Response<'a> {
     }
 
     pub fn send(&mut self) {
-        let mut headers_resp = String::new();
         if !self.text.is_empty() {
             if self.headers.get("Content-Type").is_none() {
                 self.headers
@@ -75,17 +74,40 @@ impl<'a> Response<'a> {
             }
             self.headers
                 .insert(String::from("Content-Length"), self.text.len().to_string());
-
-            for (key, value) in &self.headers {
-                headers_resp.push_str(&format!("{}: {}\r\n", key, value));
-            }
         }
-        let response = format!(
-            "{} {} {}\r\n{}\r\n{}",
-            self.protocol, self.status, self.status_msg, headers_resp, self.text
-        );
 
-        self.socket.write_all(response.as_bytes()).unwrap();
+        let mut text: Vec<u8> = self.text.clone().into_bytes();
+
+        let accept_encoding = &self.req_headers.get("Accept-Encoding");
+
+        if let Some((val, encoding)) = accept_encoding
+            .as_ref()
+            .and_then(|val| Encoding::encode(val, text.clone()).ok())
+        {
+            text = val;
+            self.headers
+                .insert(String::from("Content-Encoding"), encoding.to_string());
+        }
+        let mut headers_resp = String::new();
+        for (key, value) in &self.headers {
+            headers_resp.push_str(&format!("{}: {}\r\n", key, value));
+        }
+
+        let response = self.build_response(&headers_resp, text);
+
+        self.socket.write_all(&response).unwrap();
+    }
+
+    fn build_response(&self, headers_resp: &str, text: Vec<u8>) -> Vec<u8> {
+        let status_line = format!("{} {} {}\r\n", self.protocol, self.status, self.status_msg);
+        let headers = format!("{}\r\n", headers_resp);
+
+        let mut response = Vec::new();
+        response.extend_from_slice(status_line.as_bytes());
+        response.extend_from_slice(headers.as_bytes());
+        response.extend_from_slice(&text);
+
+        response
     }
 }
 
@@ -119,7 +141,7 @@ impl Router {
     }
 
     pub fn execute(&self, request: &mut Request, socket: &mut TcpStream) {
-        let mut response = Response::new(socket, request.version.clone());
+        let mut response = Response::new(socket, request.version.clone(), request.headers.clone());
         for route in &self.handlers {
             if let Some(path_params) =
                 Router::extract_path_params(route.path.to_string(), request.path.to_string())
