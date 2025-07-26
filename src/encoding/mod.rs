@@ -22,16 +22,27 @@ impl FromStr for SupportedEncoding {
     }
 }
 impl Encoding {
+    pub fn select_encoding(encodings: &str) -> Option<SupportedEncoding> {
+        let encoding_pars = encodings.split(",").map(|s| s.trim());
+
+        for encoding in encoding_pars {
+            if let Ok(val) = SupportedEncoding::from_str(encoding) {
+                return Some(val);
+            }
+        }
+
+        return None;
+    }
     pub fn encode(
-        encoding_type: &str,
+        encoding_type: SupportedEncoding,
         data: Vec<u8>,
     ) -> Result<(Vec<u8>, &'static str), io::Error> {
-        match SupportedEncoding::from_str(encoding_type) {
-            Ok(SupportedEncoding::Gzip) => {
+        match encoding_type {
+            SupportedEncoding::Gzip => {
                 let encoded = Encoding::gzip_encode(data)?;
                 Ok((encoded, "gzip"))
             }
-            Err(_) => Err(io::Error::new(
+            _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "Unsupported encoding",
             )),

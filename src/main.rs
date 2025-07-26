@@ -3,7 +3,8 @@ use std::{
     io::{ErrorKind, Read},
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc},
-    thread::{self, JoinHandle},
+    thread::{self, JoinHandle, sleep},
+    time::Duration,
 };
 mod encoding;
 mod parser;
@@ -27,6 +28,7 @@ fn handle_connection(stream: TcpStream, router: Router) {
     let mut request_obj = Parser::parse(&buffer);
 
     router.execute(&mut request_obj, &mut stream);
+    thread::sleep(Duration::from_millis(200));
 }
 
 pub struct HttpServer {
@@ -496,6 +498,41 @@ mod tests {
 
         assert!(headers_str.contains("HTTP/1.1 200 OK"));
         assert!(headers_str.contains("Content-Encoding: gzip"));
+        assert!(headers_str.contains("Content-Length: 23"));
+        assert!(body_str.contains("abc"));
+    }
+
+    #[test]
+    fn test_multiple_compress_scheme() {
+        let address = "127.0.0.1:4340";
+
+        start_test_server(ServerConfig {
+            address: address.to_string(),
+            ..ServerConfig::default()
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let request = "GET /echo/abc HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: invalid-encoding-1, gzip, invalid-encoding-2\r\n\r\n";
+        stream.write_all(request.as_bytes()).unwrap();
+
+        let mut buffer = Vec::new();
+        stream.read_to_end(&mut buffer).unwrap();
+
+        let header_end = buffer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("Invalid http response");
+
+        let (header_bytes, body_bytes) = buffer.split_at(header_end + 4);
+
+        let decoded_body = Encoding::decode("gzip", body_bytes.to_vec()).unwrap();
+
+        let headers_str = String::from_utf8_lossy(header_bytes);
+        let body_str = String::from_utf8_lossy(&decoded_body);
+
+        assert!(headers_str.contains("HTTP/1.1 200 OK"));
+        assert!(headers_str.contains("Content-Encoding: gzip"));
+        assert!(headers_str.contains("Content-Length: 23"));
         assert!(body_str.contains("abc"));
     }
 }

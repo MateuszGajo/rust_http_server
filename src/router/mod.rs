@@ -67,26 +67,26 @@ impl<'a> Response<'a> {
     }
 
     pub fn send(&mut self) {
-        if !self.text.is_empty() {
-            if self.headers.get("Content-Type").is_none() {
-                self.headers
-                    .insert(String::from("Content-Type"), String::from("text/plain"));
-            }
-            self.headers
-                .insert(String::from("Content-Length"), self.text.len().to_string());
-        }
-
         let mut text: Vec<u8> = self.text.clone().into_bytes();
 
         let accept_encoding = &self.req_headers.get("Accept-Encoding");
 
         if let Some((val, encoding)) = accept_encoding
             .as_ref()
+            .and_then(|val| Encoding::select_encoding(val))
             .and_then(|val| Encoding::encode(val, text.clone()).ok())
         {
             text = val;
             self.headers
                 .insert(String::from("Content-Encoding"), encoding.to_string());
+        }
+        if !text.is_empty() {
+            if self.headers.get("Content-Type").is_none() {
+                self.headers
+                    .insert(String::from("Content-Type"), String::from("text/plain"));
+            }
+            self.headers
+                .insert(String::from("Content-Length"), text.len().to_string());
         }
         let mut headers_resp = String::new();
         for (key, value) in &self.headers {
