@@ -80,6 +80,14 @@ impl<'a> Response<'a> {
             self.headers
                 .insert(String::from("Content-Encoding"), encoding.to_string());
         }
+
+        if let Some(val) = self.req_headers.get("Connection") {
+            if val == "close" {
+                self.headers
+                    .insert(String::from("Connection"), String::from("close"));
+            }
+        }
+
         if !text.is_empty() {
             if self.headers.get("Content-Type").is_none() {
                 self.headers

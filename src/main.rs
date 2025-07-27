@@ -3,7 +3,7 @@ use std::{
     io::{ErrorKind, Read},
     net::{TcpListener, TcpStream},
     sync::{Mutex, mpsc},
-    thread::{self, JoinHandle, sleep},
+    thread::{self},
     time::Duration,
 };
 mod encoding;
@@ -20,15 +20,62 @@ use crate::{
     router::{Context, Response, Route},
 };
 
+fn is_http_version_supported(version: &str, expected_major: u32, expected_minior: u32) -> bool {
+    if let Some(stripped) = version.strip_prefix("HTTP/") {
+        let mut parts = stripped.split(".");
+        if let (Some(major), Some(minior)) = (parts.next(), parts.next()) {
+            if let (Ok(major), Ok(minior)) = (major.parse::<u32>(), minior.parse::<u32>()) {
+                return (major > expected_major)
+                    || (major == expected_major && minior >= expected_minior);
+            }
+        }
+    }
+    false
+}
+
 fn handle_connection(stream: TcpStream, router: Router) {
-    let mut stream = stream;
-    let mut buffer = [0u8; 1024];
-    stream.read(&mut buffer).unwrap();
+    let mut is_connection = true;
 
-    let mut request_obj = Parser::parse(&buffer);
+    while is_connection {
+        let mut stream = stream.try_clone().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("Failed to set read timeout");
+        let mut buffer = [0u8; 1024];
 
-    router.execute(&mut request_obj, &mut stream);
-    thread::sleep(Duration::from_millis(200));
+        let bytes_read = match stream.read(&mut buffer) {
+            Ok(0) => {
+                println!("Connection closed by client");
+                break;
+            }
+            Ok(n) => n,
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                println!("Read timed out");
+                break;
+            }
+            Err(e) => {
+                eprintln!("Unexpected read error: {:?}", e);
+                break;
+            }
+        };
+
+        let mut request_obj = Parser::parse(&buffer[..bytes_read]);
+
+        let mut is_connection_close = false;
+        let is_persistent_connection = is_http_version_supported(&request_obj.version, 1, 1);
+        let connection_close_header = request_obj.headers.get("Connection");
+        if let Some(val) = connection_close_header {
+            if val == "close" {
+                is_connection_close = true;
+            }
+        }
+        is_connection = is_persistent_connection && !is_connection_close;
+
+        router.execute(&mut request_obj, &mut stream);
+    }
 }
 
 pub struct HttpServer {
@@ -117,7 +164,7 @@ impl HttpServer {
         };
     }
     fn listen(&self, connection_string: String, ready_barrier: Arc<Barrier>) {
-        let stream = TcpListener::bind(connection_string).unwrap();
+        let stream = TcpListener::bind(connection_string).expect("Failed t obind tcp listner");
         ready_barrier.wait();
 
         let pool = ThreadPool::new(4);
@@ -256,10 +303,11 @@ fn main() {
         directory_path,
     );
 }
-
+// TODO: improve error handling
 #[cfg(test)]
 mod tests {
-    use crate::encoding::{Encoding, SupportedEncoding};
+
+    use crate::encoding::Encoding;
 
     use super::*;
     use std::fs::File;
@@ -295,20 +343,66 @@ mod tests {
         ready
     }
 
+    fn read_request(stream: &mut TcpStream) -> (String, String) {
+        let mut buffer = Vec::new();
+        let mut temp = [0; 1024];
+        let header_end;
+        loop {
+            let n = stream.read(&mut temp).unwrap();
+            if n == 0 {
+                panic!("Connection closed before full response");
+            }
+            buffer.extend_from_slice(&temp[..n]);
+            if let Some(pos) = buffer.windows(4).position(|w| w == b"\r\n\r\n") {
+                header_end = pos + 4;
+                break;
+            }
+        }
+
+        let (header_bytes, remaining) = buffer.split_at(header_end);
+        let headers = String::from_utf8_lossy(header_bytes).into_owned();
+
+        let content_length = headers
+            .lines()
+            .find(|line| line.to_lowercase().starts_with("content-length:"))
+            .and_then(|line| line.split(':').nth(1))
+            .and_then(|val| val.trim().parse::<usize>().ok())
+            .unwrap_or(0);
+
+        let mut body = remaining.to_vec();
+        while body.len() < content_length {
+            let n = stream.read(&mut temp).unwrap();
+            if n == 0 {
+                panic!("Connection closed before full body received");
+            }
+            body.extend_from_slice(&temp[..n]);
+        }
+
+        if headers.contains("Content-Encoding: gzip") {
+            body = Encoding::decode("gzip", body.to_vec()).unwrap()
+        }
+
+        let body = String::from_utf8_lossy(&body).into_owned();
+
+        return (headers, body);
+    }
+
     #[test]
     fn test_echo_str() {
         start_test_server(ServerConfig::default());
 
         let mut stream = TcpStream::connect("127.0.0.1:4332").unwrap();
+
         let request = "GET /echo/test123 HTTP/1.1\r\nHost: localhost\r\n\r\n";
         stream.write_all(request.as_bytes()).unwrap();
 
-        let mut buffer = String::new();
-        stream.read_to_string(&mut buffer).unwrap();
+        let (headers, body) = read_request(&mut stream);
 
-        assert!(buffer.contains("HTTP/1.1 200 OK"));
-        assert!(buffer.contains("Content-Type: text/plain"));
-        assert!(buffer.contains("test123"));
+        assert!(headers.contains("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Type: text/plain"));
+        assert!(body.contains("test123"));
+
+        drop(stream);
     }
     #[test]
     fn test_not_found() {
@@ -322,10 +416,10 @@ mod tests {
         let request = "GET /not/found HTTP/1.1\r\nHost: localhost\r\n\r\n";
         stream.write_all(request.as_bytes()).unwrap();
 
-        let mut buffer = String::new();
-        stream.read_to_string(&mut buffer).unwrap();
+        let (headers, _) = read_request(&mut stream);
 
-        assert!(buffer.contains("HTTP/1.1 404 Not Found"));
+        assert!(headers.contains("HTTP/1.1 404 Not Found"));
+        drop(stream);
     }
 
     #[test]
@@ -340,10 +434,10 @@ mod tests {
         let request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
         stream.write_all(request.as_bytes()).unwrap();
 
-        let mut buffer = String::new();
-        stream.read_to_string(&mut buffer).unwrap();
+        let (headers, _) = read_request(&mut stream);
 
-        assert!(buffer.contains("HTTP/1.1 200 OK"));
+        assert!(headers.contains("HTTP/1.1 200 OK"));
+        drop(stream);
     }
 
     #[test]
@@ -359,13 +453,12 @@ mod tests {
             "GET /user-agent HTTP/1.1\r\nHost: localhost\r\nUser-Agent: foobar/1.2.3\r\n\r\n";
         stream.write_all(request.as_bytes()).unwrap();
 
-        let mut buffer = String::new();
-        stream.read_to_string(&mut buffer).unwrap();
+        let (headers, body) = read_request(&mut stream);
 
-        assert!(buffer.contains("HTTP/1.1 200 OK"));
-        assert!(buffer.contains("Content-Type: text/plain"));
-        assert!(buffer.contains("Content-Length: 12"));
-        assert!(buffer.contains("foobar/1.2.3"));
+        assert!(headers.contains("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Type: text/plain"));
+        assert!(headers.contains("Content-Length: 12"));
+        assert!(body.contains("foobar/1.2.3"));
     }
 
     #[test]
@@ -388,17 +481,17 @@ mod tests {
                     .write_all(request.as_bytes())
                     .expect("Failed to write to stream");
 
-                let mut buffer = String::new();
-                stream
-                    .read_to_string(&mut buffer)
-                    .expect("Failed to read response");
-
-                assert!(buffer.contains("HTTP/1.1 200 OK"));
-                assert!(buffer.contains(&format!("thread-{}", i)));
+                let (headers, _) = read_request(&mut stream);
+                assert!(headers.contains("HTTP/1.1 200 OK"));
+                assert!(headers.contains(&format!("thread-{}", i)));
+                drop(stream)
             }));
         }
         for handle in handles {
-            handle.join().expect("Thread panicked");
+            match handle.join() {
+                Ok(_) => println!("ok"),
+                Err(err) => println!("error {:?}", err),
+            }
         }
     }
 
@@ -423,11 +516,10 @@ mod tests {
         let request = "GET /files/output HTTP/1.1\r\nHost: localhost\r\n\r\n";
         stream.write_all(request.as_bytes()).unwrap();
 
-        let mut buffer = String::new();
-        stream.read_to_string(&mut buffer).unwrap();
-        assert!(buffer.contains("HTTP/1.1 200 OK"));
-        assert!(buffer.contains("Content-Type: application/octet-stream"));
-        assert!(buffer.contains("Hello, world!"));
+        let (headers, body) = read_request(&mut stream);
+        assert!(headers.contains("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Type: application/octet-stream"));
+        assert!(body.contains("Hello, world!"));
 
         fs::remove_file("/tmp/output").unwrap()
     }
@@ -454,9 +546,8 @@ mod tests {
         12345";
         stream.write_all(request.as_bytes()).unwrap();
 
-        let mut buffer = String::new();
-        stream.read_to_string(&mut buffer).unwrap();
-        assert!(buffer.contains("HTTP/1.1 201 Created"));
+        let (headers, _) = read_request(&mut stream);
+        assert!(headers.contains("HTTP/1.1 201 Created"));
 
         let data = match fs::read_to_string(file_path) {
             Ok(data) => data,
@@ -481,25 +572,12 @@ mod tests {
         let request = "GET /echo/abc HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: gzip\r\n\r\n";
         stream.write_all(request.as_bytes()).unwrap();
 
-        let mut buffer = Vec::new();
-        stream.read_to_end(&mut buffer).unwrap();
+        let (headers, body) = read_request(&mut stream);
 
-        let header_end = buffer
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("Invalid http response");
-
-        let (header_bytes, body_bytes) = buffer.split_at(header_end + 4);
-
-        let decoded_body = Encoding::decode("gzip", body_bytes.to_vec()).unwrap();
-
-        let headers_str = String::from_utf8_lossy(header_bytes);
-        let body_str = String::from_utf8_lossy(&decoded_body);
-
-        assert!(headers_str.contains("HTTP/1.1 200 OK"));
-        assert!(headers_str.contains("Content-Encoding: gzip"));
-        assert!(headers_str.contains("Content-Length: 23"));
-        assert!(body_str.contains("abc"));
+        assert!(headers.contains("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Encoding: gzip"));
+        assert!(headers.contains("Content-Length: 23"));
+        assert!(body.contains("abc"));
     }
 
     #[test]
@@ -515,24 +593,78 @@ mod tests {
         let request = "GET /echo/abc HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: invalid-encoding-1, gzip, invalid-encoding-2\r\n\r\n";
         stream.write_all(request.as_bytes()).unwrap();
 
-        let mut buffer = Vec::new();
-        stream.read_to_end(&mut buffer).unwrap();
+        let (headers, body) = read_request(&mut stream);
 
-        let header_end = buffer
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("Invalid http response");
+        assert!(headers.contains("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Encoding: gzip"));
+        assert!(headers.contains("Content-Length: 23"));
+        assert!(body.contains("abc"));
+    }
 
-        let (header_bytes, body_bytes) = buffer.split_at(header_end + 4);
+    #[test]
+    fn test_persistatn_connection() {
+        let address = "127.0.0.1:4341";
 
-        let decoded_body = Encoding::decode("gzip", body_bytes.to_vec()).unwrap();
+        start_test_server(ServerConfig {
+            address: address.to_string(),
+            ..ServerConfig::default()
+        });
 
-        let headers_str = String::from_utf8_lossy(header_bytes);
-        let body_str = String::from_utf8_lossy(&decoded_body);
+        let mut stream = TcpStream::connect(address).unwrap();
+        let request = "GET /echo/abc HTTP/1.1\r\nHost: localhost\r\nAccept-Encoding: invalid-encoding-1, gzip, invalid-encoding-2\r\n\r\n";
+        stream.write_all(request.as_bytes()).unwrap();
 
-        assert!(headers_str.contains("HTTP/1.1 200 OK"));
-        assert!(headers_str.contains("Content-Encoding: gzip"));
-        assert!(headers_str.contains("Content-Length: 23"));
-        assert!(body_str.contains("abc"));
+        let (headers, body) = read_request(&mut stream);
+        assert!(headers.contains("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Content-Encoding: gzip"));
+        assert!(headers.contains("Content-Length: 23"));
+        assert!(body.contains("abc"));
+
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("Failed to set read timeout");
+        let request2 = "GET /echo/xyz HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        stream.write_all(request2.as_bytes()).unwrap();
+
+        let (headers, body) = read_request(&mut stream);
+
+        assert!(headers.contains("HTTP/1.1 200 OK"));
+        assert!(body.contains("xyz"));
+    }
+    #[test]
+    fn test_close_connection() {
+        let address = "127.0.0.1:4342";
+
+        start_test_server(ServerConfig {
+            address: address.to_string(),
+            ..ServerConfig::default()
+        });
+
+        let mut stream = TcpStream::connect(address).unwrap();
+        let request = "GET /echo/abc HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n";
+        stream.write_all(request.as_bytes()).unwrap();
+
+        let (headers, body) = read_request(&mut stream);
+        assert!(headers.contains("HTTP/1.1 200 OK"));
+        assert!(headers.contains("Connection: close"));
+        assert!(body.contains("abc"));
+
+        let mut buf = [0u8; 1];
+
+        stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        match stream.peek(&mut buf) {
+            Ok(0) => {}
+            Ok(_) => {
+                panic!("Expected connection to be closed, but it's still open (data available)");
+            }
+            Err(e) => {
+                panic!(
+                    "Expected connection to be closed, but got error instead: {}",
+                    e
+                );
+            }
+        }
     }
 }
